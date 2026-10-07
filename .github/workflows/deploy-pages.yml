@@ -34,6 +34,10 @@ jobs:
       - name: Build frontend
         working-directory: apps/frontend
         run: npm run build
+        env:
+          VITE_PRIMARY_BACKEND_URL: https://coscriptaa.onrender.com
+          VITE_WEBSOCKET_SERVER_URL: wss://websocket-server-main-2q2t.onrender.com
+          VITE_YJS_WEBSOCKET_URL: wss://websocket-server-yjs.onrender.com
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
