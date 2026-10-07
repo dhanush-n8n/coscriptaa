@@ -3,7 +3,9 @@ import { exec } from 'child_process'
 import fs from 'fs/promises'
 import path from 'path'
 import dotenv from 'dotenv';
+import util from 'util';
 
+const execPromise = util.promisify(exec);
 dotenv.config();
 
 // Consumer client to pull code execution jobs from the Redis List
@@ -16,24 +18,77 @@ const pubClient = createClient({
     url: process.env.REDIS_URL,
 });
 
+// Helper to check if docker is available
+async function isDockerAvailable(): Promise<boolean> {
+    try {
+        await execPromise('docker --version');
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+// Helper to use Wandbox API when Docker daemon is not available (e.g. Render Node environments)
+async function executeWithWandbox(code: string, language: string, input: string): Promise<string> {
+    const compilerMap: Record<string, string> = {
+        'javascript': 'nodejs-20.17.0',
+        'python': 'cpython-3.14.0',
+        'cpp': 'gcc-13.2.0',
+        'go': 'go-1.23.2'
+    };
+    
+    const compiler = compilerMap[language];
+    if (!compiler) return `Error: Unsupported language for cloud sandbox: ${language}`;
+
+    try {
+        const response = await fetch('https://wandbox.org/api/compile.json', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                compiler,
+                code,
+                stdin: input || ""
+            })
+        });
+
+        if (!response.ok) {
+            return `Error: Cloud sandbox compilation failed with status ${response.status}`;
+        }
+
+        const data = await response.json();
+        return data.program_error || data.program_output || data.compiler_error || data.compiler_output || "Executed successfully with no output.";
+    } catch (e: any) {
+        return `Error connecting to Cloud Sandbox: ${e.message}`;
+    }
+}
+
 // Core function: Creates temp files, spawns an isolated Docker container for the requested language, and captures output
 async function processSubmission(submission: any) {
     const { code, language, roomId, submissionId, input } = JSON.parse(submission);
 
-    console.log(JSON.stringify(submission));
-
     console.log(`Processing submission for room id: ${roomId}, submission id: ${submissionId}`);
+
+    const hasDocker = await isDockerAvailable();
+
+    if (!hasDocker) {
+        console.log(`Docker not found on host. Falling back to Wandbox Cloud Sandbox for room ${roomId}`);
+        const result = await executeWithWandbox(code, language, input);
+        try {
+            await pubClient.publish(roomId, result);
+        } catch (e) {
+            console.error("Failed to publish result to Redis,", e);
+        }
+        return;
+    }
 
     // 1. Create a unique temporary directory for this specific job to prevent collisions
     const codeDir = path.resolve(`./tmp/user-${Date.now()}`);
     await fs.mkdir(codeDir, { recursive: true });
 
-
     let codeFilePath = "";
     let executionCommand = "";
 
     const inputFilePath = path.join(codeDir, "input.txt");
-
     const dockerPath = codeDir.replace(/\\/g, '/');
 
     try {
@@ -45,15 +100,12 @@ async function processSubmission(submission: any) {
             case "javascript":
                 codeFilePath = path.join(codeDir, "userCode.js");
                 await fs.writeFile(codeFilePath, code);
-
                 executionCommand = `docker run --rm --memory="512m" --cpus="0.5" --network none -v "${dockerPath}:/usr/src/app" -w /usr/src/app node:18-alpine node userCode.js input.txt`;
                 break;
 
             case "python":
                 codeFilePath = path.join(codeDir, "userCode.py");
-
                 await fs.writeFile(codeFilePath, code);
-
                 executionCommand = `docker run --rm --memory="512m" --cpus="0.5" --network none -v "${dockerPath}:/usr/src/app" -w /usr/src/app python:3.9-alpine python userCode.py input.txt`;
                 break;
 
