@@ -26,6 +26,8 @@ interface CodeEditorHeaderProps {
   onOpenDockerSandbox?: () => void
   onOpenConfidenceAndRisk?: () => void
   onOpenAIExplanation?: () => void
+  onOpenRealConflictModal?: () => void
+  realConflictActive?: boolean
   onBack?: () => void
 }
 
@@ -52,6 +54,8 @@ export const CodeEditorHeader = ({
   onOpenDockerSandbox,
   onOpenConfidenceAndRisk,
   onOpenAIExplanation,
+  onOpenRealConflictModal,
+  realConflictActive = false,
   onBack,
 }: CodeEditorHeaderProps) => {
   return (
@@ -70,6 +74,16 @@ export const CodeEditorHeader = ({
               <span className="text-xs font-mono text-[#3b49df] bg-blue-50 px-2 py-0.5 rounded-md border border-blue-200">
                 {activeFileName}
               </span>
+            )}
+            {realConflictActive && (
+              <button
+                onClick={onOpenRealConflictModal}
+                className="flex items-center gap-1.5 text-[11px] font-bold text-rose-700 bg-rose-100 border border-rose-300 px-2 py-0.5 rounded-md hover:bg-rose-200 transition-colors animate-bounce"
+                title="Genuine concurrent conflict detected! Click to resolve with AI"
+              >
+                <Zap className="h-3.5 w-3.5 text-rose-600" />
+                <span>⚠️ AI Conflict Active</span>
+              </button>
             )}
             {conflictsCount > 0 ? (
               <button
@@ -233,6 +247,22 @@ export const CodeEditorHeader = ({
           >
             <Lightbulb className="h-4 w-4 text-amber-500" />
             <span className="hidden xl:inline">AI Explanation (#24)</span>
+          </Button>
+        )}
+
+        {onOpenRealConflictModal && (
+          <Button
+            onClick={onOpenRealConflictModal}
+            type="button"
+            variant="outline"
+            className={`h-10 rounded-xl border-rose-300 bg-rose-50 px-3.5 font-bold text-rose-700 hover:bg-rose-100 hover:text-rose-800 transition shadow-sm flex items-center gap-1.5 ${realConflictActive ? 'animate-pulse ring-2 ring-rose-500 bg-rose-100 text-rose-900 font-extrabold' : ''}`}
+            title="Real-time Semantic Conflict Detection & AI 3-Option Resolution"
+          >
+            <Zap className={`h-4 w-4 ${realConflictActive ? 'text-rose-600 animate-spin' : 'text-rose-500'}`} />
+            <span className="hidden xl:inline">AI Conflict Resolver</span>
+            {realConflictActive && (
+              <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping ml-1" />
+            )}
           </Button>
         )}
 

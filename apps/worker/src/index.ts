@@ -6,16 +6,17 @@ import dotenv from 'dotenv';
 import util from 'util';
 
 const execPromise = util.promisify(exec);
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 dotenv.config();
 
 // Consumer client to pull code execution jobs from the Redis List
 const client = createClient({
-    url: process.env.REDIS_URL,
+    url: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
 });
 
 // Publisher client to send execution results back to the specific room via Redis Pub/Sub
 const pubClient = createClient({
-    url: process.env.REDIS_URL,
+    url: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
 });
 
 // Helper to check if docker is available
@@ -62,11 +63,90 @@ async function executeWithWandbox(code: string, language: string, input: string)
     }
 }
 
+export function detectLanguageMismatch(code: string, targetLanguage: string): { mismatch: boolean; detectedLanguage?: string; reason?: string } {
+    const trimmed = (code || '').trim();
+    if (!trimmed) return { mismatch: false };
+
+    const normLang = (targetLanguage || '').toLowerCase();
+
+    // Check if target is Python but code is JavaScript
+    if (normLang === 'python') {
+        const hasJsFunction = /(?:^|\n)\s*(?:async\s+)?function\s+[a-zA-Z0-9_$]+\s*\(/.test(trimmed);
+        const hasJsDeclarations = /(?:^|\n)\s*(?:const|let|var)\s+[a-zA-Z0-9_$]+\s*=/.test(trimmed);
+        const hasJsStrictEq = /===|!==/.test(trimmed);
+        const hasJsMath = /\bMath\.(?:max|min|floor|ceil|abs|round)\b/.test(trimmed);
+        const hasJsConsole = /\bconsole\.(?:log|error|warn)\b/.test(trimmed);
+        const hasJsBlockBraces = /(?:^|\n)\s*(?:if|while|for)\s*\([^)]*\)\s*\{/.test(trimmed);
+        const hasJsTypeof = /\btypeof\s+/.test(trimmed);
+        const hasJsNull = /\bnull\b/.test(trimmed);
+        const hasJsUndefined = /\bundefined\b/.test(trimmed);
+
+        if (hasJsFunction || hasJsDeclarations || hasJsStrictEq || hasJsMath || hasJsConsole || hasJsBlockBraces || hasJsTypeof || hasJsNull || hasJsUndefined) {
+            const reasons: string[] = [];
+            if (hasJsFunction) reasons.push("JavaScript 'function' declaration");
+            if (hasJsDeclarations) reasons.push("JavaScript variable declaration ('const'/'let'/'var')");
+            if (hasJsStrictEq) reasons.push("JavaScript strict equality operator ('===' / '!==')");
+            if (hasJsMath) reasons.push("JavaScript 'Math' library call");
+            if (hasJsConsole) reasons.push("JavaScript 'console.log'");
+            if (hasJsBlockBraces) reasons.push("JavaScript brace-enclosed block syntax");
+            if (hasJsTypeof) reasons.push("JavaScript 'typeof' operator");
+            if (hasJsNull) reasons.push("JavaScript 'null' literal");
+            if (hasJsUndefined) reasons.push("JavaScript 'undefined' literal");
+
+            return {
+                mismatch: true,
+                detectedLanguage: 'javascript',
+                reason: `Language Mismatch Blocked: Target runtime is PYTHON, but code contains ${reasons.join(', ')}. Execution aborted to prevent runtime syntax corruption.`
+            };
+        }
+    }
+
+    // Check if target is JavaScript/TypeScript but code is Python
+    if (normLang === 'javascript' || normLang === 'typescript') {
+        const hasPyDef = /(?:^|\n)\s*(?:async\s+)?def\s+[a-zA-Z0-9_]+\s*\(/.test(trimmed);
+        const hasPyKwargs = /\bkwargs\b|\*\*kwargs/.test(trimmed);
+        const hasPyElif = /(?:^|\n)\s*elif\s+/.test(trimmed);
+        const hasPyBooleans = /\b(?:None|True|False)\b/.test(trimmed);
+        const hasPyImport = /(?:^|\n)\s*(?:from\s+[a-zA-Z0-9_.]+\s+import|import\s+[a-zA-Z0-9_]+)\s*$/m.test(trimmed);
+        const hasPyExcept = /(?:^|\n)\s*except(?:\s+.*)?:/.test(trimmed);
+
+        if (hasPyDef || hasPyKwargs || hasPyElif || hasPyBooleans || hasPyImport || hasPyExcept) {
+            const reasons: string[] = [];
+            if (hasPyDef) reasons.push("Python 'def' function declaration");
+            if (hasPyKwargs) reasons.push("Python 'kwargs' parameter");
+            if (hasPyElif) reasons.push("Python 'elif' keyword");
+            if (hasPyBooleans) reasons.push("Python boolean constants ('None'/'True'/'False')");
+            if (hasPyImport) reasons.push("Python 'import' statement");
+            if (hasPyExcept) reasons.push("Python 'except' block");
+
+            return {
+                mismatch: true,
+                detectedLanguage: 'python',
+                reason: `Language Mismatch Blocked: Target runtime is JAVASCRIPT, but code contains ${reasons.join(', ')}. Execution aborted to prevent runtime syntax corruption.`
+            };
+        }
+    }
+
+    return { mismatch: false };
+}
+
 // Core function: Creates temp files, spawns an isolated Docker container for the requested language, and captures output
 async function processSubmission(submission: any) {
     const { code, language, roomId, submissionId, input } = JSON.parse(submission);
 
     console.log(`Processing submission for room id: ${roomId}, submission id: ${submissionId}`);
+
+    // Language Mismatch Guardrail
+    const mismatch = detectLanguageMismatch(code, language);
+    if (mismatch.mismatch) {
+        console.warn(`[Worker Guardrail Blocked] ${mismatch.reason}`);
+        try {
+            await pubClient.publish(roomId, `\n[EXECUTION BLOCKED - LANGUAGE MISMATCH]\n${mismatch.reason}\n`);
+        } catch (e) {
+            console.error("Failed to publish mismatch alert", e);
+        }
+        return;
+    }
 
     const hasDocker = await isDockerAvailable();
 

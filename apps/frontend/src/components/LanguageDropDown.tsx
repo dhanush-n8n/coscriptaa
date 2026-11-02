@@ -61,6 +61,7 @@ export const LanguageDropdown = ({ value, onChange }: LanguageDropdownProps) => 
           {languages.map((language) => (
             <DropdownMenuItem
               key={language.value}
+              onSelect={() => onChange(language.value)}
               onClick={() => onChange(language.value)}
               className="text-white hover:bg-gray-700/80 hover:text-gray-100 focus:bg-gray-700/80 focus:text-gray-100 cursor-pointer transition-colors"
             >

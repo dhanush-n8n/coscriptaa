@@ -73,7 +73,7 @@ export class ASTParser {
      * Parses a code string into a structural AST representation
      */
     public static parseFile(fileName: string, code: string, language?: string): FileAST {
-        const lang = language || this.detectLanguage(fileName);
+        const lang = language || this.detectLanguage(fileName, code);
         const lines = code.split('\n');
 
         const functions: ASTFunction[] = [];
@@ -108,13 +108,54 @@ export class ASTParser {
         };
     }
 
-    private static detectLanguage(fileName: string): string {
-        const ext = fileName.split('.').pop()?.toLowerCase();
-        if (ext === 'py') return 'python';
-        if (ext === 'ts' || ext === 'tsx') return 'typescript';
-        if (ext === 'cpp' || ext === 'c' || ext === 'h') return 'cpp';
-        if (ext === 'go') return 'go';
-        return 'javascript';
+    public static detectLanguage(fileName?: string, code?: string, explicitLanguage?: string): string {
+        // 0. Explicit language override (highest priority)
+        if (explicitLanguage && explicitLanguage !== 'unknown') {
+            return explicitLanguage.toLowerCase();
+        }
+
+        // 1. Comprehensive source code pattern analysis (prevents main.js with Python code being misidentified as JavaScript)
+        if (code && code.trim().length > 0) {
+            const trimmed = code.trim();
+
+            // Strong Python indicators
+            const hasPythonDef = /(?:^|\n)\s*(?:async\s+)?def\s+[a-zA-Z0-9_]+\s*\(/.test(trimmed);
+            const hasPythonImport = /(?:^|\n)\s*(?:from\s+[a-zA-Z0-9_.]+\s+import|import\s+[a-zA-Z0-9_]+)/.test(trimmed) && !/;\s*$/.test(trimmed);
+            const hasPythonKeywords = /(?:^|\n)\s*(?:elif\s+|except(?:\s+.*)?:|finally:|pass\s*$|lambda\s+|with\s+.*:)/m.test(trimmed);
+            const hasPythonBooleans = /\b(?:None|True|False)\b/.test(trimmed) && !/\b(?:null|undefined|true|false)\b/.test(trimmed);
+            const hasPythonPrint = /(?:^|\n)\s*print\s*\(.*?\)\s*$/m.test(trimmed) && !trimmed.includes(';');
+            const hasPythonClass = /(?:^|\n)\s*class\s+[a-zA-Z0-9_]+(?:\(.*?\))?:\s*$/m.test(trimmed);
+
+            // Strong JavaScript / TypeScript indicators
+            const hasJsKeywords = /(?:^|\n)\s*(?:function\s+[a-zA-Z0-9_$]+|(?:const|let|var)\s+[a-zA-Z0-9_$]+\s*=|import\s+.*from\s+['"]|export\s+(?:default\s+)?(?:function|const|let|var|class)|console\.log\()/m.test(trimmed);
+            const hasJsTokens = /\b(?:null|undefined|typeof|===|!==)\b/.test(trimmed) || /=>\s*\{/.test(trimmed);
+
+            const isPythonCode = (hasPythonDef || hasPythonImport || hasPythonKeywords || hasPythonBooleans || hasPythonPrint || hasPythonClass);
+            const isJsCode = (hasJsKeywords || hasJsTokens);
+
+            if (isPythonCode && !isJsCode) {
+                return 'python';
+            }
+            if (isJsCode && !isPythonCode) {
+                return 'javascript';
+            }
+        }
+
+        // 2. Check file extension if code is ambiguous or absent
+        if (fileName && fileName.includes('.')) {
+            const ext = fileName.split('.').pop()?.toLowerCase();
+            if (ext === 'py' || ext === 'pyw' || ext === 'ipynb') return 'python';
+            if (ext === 'ts' || ext === 'tsx') return 'typescript';
+            if (ext === 'cpp' || ext === 'c' || ext === 'h' || ext === 'hpp' || ext === 'cc') return 'cpp';
+            if (ext === 'go') return 'go';
+            if (ext === 'java') return 'java';
+            if (ext === 'rs') return 'rust';
+            if (ext === 'rb') return 'ruby';
+            if (ext === 'js' || ext === 'mjs' || ext === 'cjs' || ext === 'jsx') return 'javascript';
+        }
+
+        // Safe fallback: Do NOT silently default to JavaScript if language is indeterminate
+        return 'unknown';
     }
 
     /**
@@ -316,6 +357,32 @@ export class ASTParser {
                 const rawParams = match[2];
                 const params = this.extractParams(rawParams).filter(p => p !== 'self' && p !== 'cls');
                 const minParams = params.filter(p => !p.includes('=')).length;
+
+                // Lookahead for Python function body & return expression
+                const defIndent = lineText.search(/\S/);
+                let returnExpr = '';
+                let returnOp = '';
+                const bodyLines: string[] = [lineText];
+
+                for (let j = idx + 1; j < lines.length; j++) {
+                    const l = lines[j];
+                    const lTrimmed = l.trim();
+                    if (!lTrimmed) {
+                        bodyLines.push(l);
+                        continue;
+                    }
+                    const indent = l.search(/\S/);
+                    if (indent <= defIndent && !lTrimmed.startsWith('#')) {
+                        break;
+                    }
+                    bodyLines.push(l);
+                    const retMatch = l.match(/return\s+(.+)/);
+                    if (retMatch && !returnExpr) {
+                        returnExpr = retMatch[1].trim();
+                        returnOp = this.detectOperation(returnExpr);
+                    }
+                }
+
                 ast.functions.push({
                     name,
                     params: params.map(p => p.split('=')[0].trim().split(':')[0].trim()),
@@ -324,9 +391,12 @@ export class ASTParser {
                     isAsync: trimmed.startsWith('async def'),
                     isExported: true, // Python exports top-level defs by default
                     startLine: lineNum,
-                    endLine: lineNum,
+                    endLine: Math.min(lines.length, idx + bodyLines.length),
                     file: fileName,
-                    rawSignature: `def ${name}(${rawParams.trim()}):`
+                    rawSignature: `def ${name}(${rawParams.trim()}):`,
+                    bodySnippet: bodyLines.join('\n'),
+                    returnExpression: returnExpr,
+                    returnOperation: returnOp
                 });
             }
 

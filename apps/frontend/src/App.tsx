@@ -9,7 +9,7 @@ import { ConflictDashboard } from "./pages/ConflictDashboard";
 const App = ()=>{
  
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={import.meta.env.BASE_URL}>
       <Routes>
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/conflict-dashboard" element={<ConflictDashboard />} />

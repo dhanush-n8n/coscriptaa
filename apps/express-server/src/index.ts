@@ -23,8 +23,12 @@ import { AIResolutionValidator, ValidatedAISolution, ValidationPipelineRun } fro
 import { DockerSandboxValidator, DockerSandboxExecutionReport, SandboxValidationSuiteResult, RollbackSnapshot } from "./services/sandboxValidator";
 import { RiskScorerService, EditRiskScore, EditChangeCategory, AIConfidenceOption, DeveloperApprovalDecision } from "./services/riskScorer";
 import { DashboardMetricsService, FullDashboardData } from "./services/dashboardMetrics";
+import { RealConflictEngine, DeveloperActiveEdit, GenuineConflict, ResolutionOption, ConflictHistoryRecord } from "./services/realConflictEngine";
 
-dotenv.config();
+import path from "path";
+import http from "http";
+
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const app = express();
 
@@ -33,7 +37,7 @@ app.use(cors());
 
 // Redis Client for queue and room persistence
 const redisClient = createClient({
-    url: process.env.REDIS_URL
+    url: process.env.REDIS_URL || 'redis://127.0.0.1:6379'
 });
 
 redisClient.on("error", (err) => console.log("Redis Client Error", err));
@@ -66,10 +70,13 @@ async function cacheSet(key: string, value: string): Promise<void> {
 async function cachePublish(channel: string, message: string): Promise<void> {
     if (redisClient.isOpen) {
         try {
-            await redisClient.publish(channel, message);
+            const receivers = await redisClient.publish(channel, message);
+            console.log(`[cachePublish] Published to channel '${channel}', receivers: ${receivers}`);
         } catch (e) {
-            // ignore
+            console.error(`[cachePublish] Error publishing to '${channel}':`, e);
         }
+    } else {
+        console.warn(`[cachePublish] redisClient is NOT open!`);
     }
 }
 
@@ -241,6 +248,190 @@ app.post('/api/rooms/:roomId/conflicts/resolve', async (req: any, res: any) => {
         res.json({ success: true, remainingCount: conflicts.length });
     } catch (err: any) {
         res.status(500).json({ error: "Failed to resolve conflict" });
+    }
+});
+
+// -------------------------------------------------------------
+// GENUINE REAL-TIME SEMANTIC CONFLICT ENGINE (Non-Disruptive Yjs Tracking)
+// -------------------------------------------------------------
+
+// 1. Track in-flight developer edit against base version and detect genuine semantic conflicts
+app.post('/api/rooms/:roomId/track-edit', async (req: any, res: any) => {
+    const { roomId } = req.params;
+    const { edit, baseContent } = req.body;
+
+    if (!edit || !edit.fileId || !edit.userId) {
+        return res.status(400).json({ error: "Invalid edit payload" });
+    }
+
+    try {
+        if (baseContent) {
+            await RealConflictEngine.setBaseVersion(redisClient, roomId, edit.fileId, baseContent);
+        }
+
+        const { conflict } = await RealConflictEngine.recordEdit(redisClient, roomId, edit);
+
+        if (conflict) {
+            console.log(`[Genuine Conflict Detected] In room ${roomId} on symbol '${conflict.symbolName}' between ${conflict.devA.userName} and ${conflict.devB.userName}`);
+
+            // Pre-generate the 3 real resolution options with validation
+            const solutions = await RealConflictEngine.generateThreeResolutions(conflict);
+            conflict.solutions = solutions;
+
+            // Cache active conflict
+            await cacheSet(`room:${roomId}:active_conflict`, JSON.stringify(conflict));
+
+            // Real-time broadcast to all peers via Redis Pub/Sub
+            await cachePublish(roomId, JSON.stringify({
+                type: "broadcast",
+                excludeUserId: null,
+                data: {
+                    type: "genuine_conflict_detected",
+                    conflict,
+                    timestamp: Date.now()
+                }
+            }));
+        }
+
+        res.json({ success: true, conflict });
+    } catch (err: any) {
+        console.error("Error in /track-edit:", err);
+        res.status(500).json({ error: "Failed to track edit", details: err.message });
+    }
+});
+
+// 2. Fetch or trigger 3-option AI conflict resolution with validation
+app.post('/api/rooms/:roomId/resolve-conflict-ai', async (req: any, res: any) => {
+    const { roomId } = req.params;
+    const { conflict } = req.body;
+
+    if (!conflict) {
+        return res.status(400).json({ error: "Conflict object is required" });
+    }
+
+    try {
+        console.log(`[AI Resolution] Generating 3 solutions & real validation for conflict '${conflict.symbolName}'...`);
+        const solutions = await RealConflictEngine.generateThreeResolutions(conflict);
+        conflict.solutions = solutions;
+
+        // Cache updated conflict
+        await cacheSet(`room:${roomId}:active_conflict`, JSON.stringify(conflict));
+
+        res.json({ success: true, solutions, conflict });
+    } catch (err: any) {
+        console.error("Error generating AI resolutions:", err);
+        res.status(500).json({ error: "Failed to generate AI resolutions", details: err.message });
+    }
+});
+
+// 2b. Recalculate Conflict Risk & AI Confidence dynamically
+app.post('/api/rooms/:roomId/recalculate-risk', async (req: any, res: any) => {
+    const { roomId } = req.params;
+    const { conflict, editA, editB } = req.body;
+
+    if (!conflict) {
+        return res.status(400).json({ error: "Conflict object is required" });
+    }
+
+    try {
+        const riskAssessment = RealConflictEngine.calculateConflictRisk(conflict, editA, editB);
+        conflict.riskAssessment = riskAssessment;
+        const solutions = await RealConflictEngine.generateThreeResolutions(conflict);
+        conflict.solutions = solutions;
+
+        await cacheSet(`room:${roomId}:active_conflict`, JSON.stringify(conflict));
+
+        res.json({ success: true, riskAssessment, solutions, conflict });
+    } catch (err: any) {
+        console.error("Error in recalculate-risk:", err);
+        res.status(500).json({ error: "Failed to recalculate risk", details: err.message });
+    }
+});
+
+// 3. Apply accepted resolution, save to persistent history in Redis, and broadcast
+app.post('/api/rooms/:roomId/apply-resolution', async (req: any, res: any) => {
+    const { roomId } = req.params;
+    const { conflict, chosenOptionId, resolvedCode, fullResolvedContent, resolvedBy, optionTitle, explanation } = req.body;
+
+    if (!conflict || !chosenOptionId || !resolvedCode) {
+        return res.status(400).json({ error: "Missing required resolution parameters" });
+    }
+
+    const explicitLang = req.body.language || conflict.language;
+    const isPythonTarget = explicitLang === 'python' || conflict.fileName?.endsWith('.py') || /(?:^|\n)\s*(?:async\s+)?def\s+/.test(resolvedCode);
+    const targetLang = isPythonTarget ? 'python' : (explicitLang || 'javascript');
+    const mismatch = detectLanguageMismatch(resolvedCode, targetLang);
+    if (mismatch.mismatch) {
+        console.warn(`[Apply Resolution Blocked] ${mismatch.reason}`);
+        return res.status(400).json({
+            error: "Language mismatch detected in resolution code",
+            reason: mismatch.reason
+        });
+    }
+
+    try {
+        console.log(`[Apply Resolution] Room ${roomId}: Applying Option ${chosenOptionId} for '${conflict.symbolName}' by ${resolvedBy || 'Developer'}`);
+
+        const historyRecord = await RealConflictEngine.saveResolution(
+            redisClient,
+            roomId,
+            conflict,
+            chosenOptionId,
+            resolvedCode,
+            resolvedBy || 'Developer',
+            optionTitle || `Option ${chosenOptionId}`,
+            explanation || "Resolved by collaborative agreement",
+            fullResolvedContent
+        );
+
+        // Clear active conflict
+        await cacheSet(`room:${roomId}:active_conflict`, JSON.stringify(null));
+
+        // Real-time broadcast to all peers via Redis Pub/Sub
+        await cachePublish(roomId, JSON.stringify({
+            type: "broadcast",
+            excludeUserId: null,
+            data: {
+                type: "genuine_conflict_resolved",
+                conflictId: conflict.id,
+                fileId: conflict.fileId,
+                symbolName: conflict.symbolName,
+                chosenOptionId,
+                resolvedCode,
+                fullResolvedContent,
+                resolvedBy: resolvedBy || 'Developer',
+                historyRecord,
+                timestamp: Date.now()
+            }
+        }));
+
+        res.json({ success: true, historyRecord });
+    } catch (err: any) {
+        console.error("Error in /apply-resolution:", err);
+        res.status(500).json({ error: "Failed to apply resolution", details: err.message });
+    }
+});
+
+// 4. Retrieve persistent conflict history for a room
+app.get('/api/rooms/:roomId/conflict-history', async (req: any, res: any) => {
+    const { roomId } = req.params;
+    try {
+        const history = await RealConflictEngine.getHistory(redisClient, roomId);
+        res.json({ success: true, history, count: history.length });
+    } catch (err: any) {
+        res.status(500).json({ error: "Failed to fetch conflict history" });
+    }
+});
+
+// 5. Retrieve active conflict for a room
+app.get('/api/rooms/:roomId/active-conflict', async (req: any, res: any) => {
+    const { roomId } = req.params;
+    try {
+        const raw = await cacheGet(`room:${roomId}:active_conflict`);
+        const conflict = (raw && raw !== 'null') ? JSON.parse(raw) : null;
+        res.json({ success: true, conflict });
+    } catch (err: any) {
+        res.status(500).json({ error: "Failed to get active conflict" });
     }
 });
 
@@ -829,7 +1020,6 @@ app.post('/api/dashboard/resolve-conflict', async (req: any, res: any) => {
 // -------------------------------------------------------------
 import { exec } from 'child_process';
 import fs from 'fs/promises';
-import path from 'path';
 import util from 'util';
 
 const execPromise = util.promisify(exec);
@@ -878,10 +1068,89 @@ async function executeWithWandbox(code: string, language: string, input: string)
     }
 }
 
+export function detectLanguageMismatch(code: string, targetLanguage: string): { mismatch: boolean; detectedLanguage?: string; reason?: string } {
+    const trimmed = (code || '').trim();
+    if (!trimmed) return { mismatch: false };
+
+    const normLang = (targetLanguage || '').toLowerCase();
+
+    // Check if target is Python but code is JavaScript
+    if (normLang === 'python') {
+        const hasJsFunction = /(?:^|\n)\s*(?:async\s+)?function\s+[a-zA-Z0-9_$]+\s*\(/.test(trimmed);
+        const hasJsDeclarations = /(?:^|\n)\s*(?:const|let|var)\s+[a-zA-Z0-9_$]+\s*=/.test(trimmed);
+        const hasJsStrictEq = /===|!==/.test(trimmed);
+        const hasJsMath = /\bMath\.(?:max|min|floor|ceil|abs|round)\b/.test(trimmed);
+        const hasJsConsole = /\bconsole\.(?:log|error|warn)\b/.test(trimmed);
+        const hasJsBlockBraces = /(?:^|\n)\s*(?:if|while|for)\s*\([^)]*\)\s*\{/.test(trimmed);
+        const hasJsTypeof = /\btypeof\s+/.test(trimmed);
+        const hasJsNull = /\bnull\b/.test(trimmed);
+        const hasJsUndefined = /\bundefined\b/.test(trimmed);
+
+        if (hasJsFunction || hasJsDeclarations || hasJsStrictEq || hasJsMath || hasJsConsole || hasJsBlockBraces || hasJsTypeof || hasJsNull || hasJsUndefined) {
+            const reasons: string[] = [];
+            if (hasJsFunction) reasons.push("JavaScript 'function' declaration");
+            if (hasJsDeclarations) reasons.push("JavaScript variable declaration ('const'/'let'/'var')");
+            if (hasJsStrictEq) reasons.push("JavaScript strict equality operator ('===' / '!==')");
+            if (hasJsMath) reasons.push("JavaScript 'Math' library call");
+            if (hasJsConsole) reasons.push("JavaScript 'console.log'");
+            if (hasJsBlockBraces) reasons.push("JavaScript brace-enclosed block syntax");
+            if (hasJsTypeof) reasons.push("JavaScript 'typeof' operator");
+            if (hasJsNull) reasons.push("JavaScript 'null' literal");
+            if (hasJsUndefined) reasons.push("JavaScript 'undefined' literal");
+
+            return {
+                mismatch: true,
+                detectedLanguage: 'javascript',
+                reason: `Language Mismatch Blocked: Target runtime is PYTHON, but code contains ${reasons.join(', ')}. Execution aborted to prevent runtime syntax corruption.`
+            };
+        }
+    }
+
+    // Check if target is JavaScript/TypeScript but code is Python
+    if (normLang === 'javascript' || normLang === 'typescript') {
+        const hasPyDef = /(?:^|\n)\s*(?:async\s+)?def\s+[a-zA-Z0-9_]+\s*\(/.test(trimmed);
+        const hasPyKwargs = /\bkwargs\b|\*\*kwargs/.test(trimmed);
+        const hasPyElif = /(?:^|\n)\s*elif\s+/.test(trimmed);
+        const hasPyBooleans = /\b(?:None|True|False)\b/.test(trimmed);
+        const hasPyImport = /(?:^|\n)\s*(?:from\s+[a-zA-Z0-9_.]+\s+import|import\s+[a-zA-Z0-9_]+)\s*$/m.test(trimmed);
+        const hasPyExcept = /(?:^|\n)\s*except(?:\s+.*)?:/.test(trimmed);
+
+        if (hasPyDef || hasPyKwargs || hasPyElif || hasPyBooleans || hasPyImport || hasPyExcept) {
+            const reasons: string[] = [];
+            if (hasPyDef) reasons.push("Python 'def' function declaration");
+            if (hasPyKwargs) reasons.push("Python 'kwargs' parameter");
+            if (hasPyElif) reasons.push("Python 'elif' keyword");
+            if (hasPyBooleans) reasons.push("Python boolean constants ('None'/'True'/'False')");
+            if (hasPyImport) reasons.push("Python 'import' statement");
+            if (hasPyExcept) reasons.push("Python 'except' block");
+
+            return {
+                mismatch: true,
+                detectedLanguage: 'python',
+                reason: `Language Mismatch Blocked: Target runtime is JAVASCRIPT, but code contains ${reasons.join(', ')}. Execution aborted to prevent runtime syntax corruption.`
+            };
+        }
+    }
+
+    return { mismatch: false };
+}
+
 // Process submission immediately
 async function processSubmission(submission: any) {
     const { code, language, roomId, submissionId, input } = submission;
     console.log(`Processing submission for room id: ${roomId}, submission id: ${submissionId}`);
+
+    // Language Mismatch Guardrail: Never execute JS in Python runtime or vice versa
+    const mismatch = detectLanguageMismatch(code, language);
+    if (mismatch.mismatch) {
+        console.warn(`[Execution Guardrail Blocked] ${mismatch.reason}`);
+        try {
+            await cachePublish(roomId, `\n[EXECUTION BLOCKED - LANGUAGE MISMATCH]\n${mismatch.reason}\n`);
+        } catch (e) {
+            console.error("Failed to publish mismatch alert", e);
+        }
+        return;
+    }
 
     const hasDocker = await isDockerAvailable();
 
@@ -966,7 +1235,21 @@ async function processSubmission(submission: any) {
 app.post('/submit', async (req: any, res: any) => {
     const { code, language, roomId, input } = req.body;
     const submissionId = `submission-${Date.now()}-${roomId}`;
-    console.log(`Received submission from room ${roomId}`);
+    console.log(`Received submission from room ${roomId} (language: ${language})`);
+
+    // Explicit Language Mismatch Guardrail: Never send JS code to Python runtime or vice versa
+    const mismatch = detectLanguageMismatch(code, language);
+    if (mismatch.mismatch) {
+        console.warn(`[Execution Guardrail Blocked] ${mismatch.reason}`);
+        if (redisClient.isOpen && roomId) {
+            await cachePublish(roomId, `\n[EXECUTION BLOCKED - LANGUAGE MISMATCH]\n${mismatch.reason}\n`).catch(e => console.error(e));
+        }
+        return res.status(400).json({
+            error: "Language mismatch detected",
+            reason: mismatch.reason,
+            output: `\n[EXECUTION BLOCKED - LANGUAGE MISMATCH]\n${mismatch.reason}\n`
+        });
+    }
 
     try {
         // We still optionally push to Redis queue if needed by external workers, 
@@ -986,17 +1269,56 @@ app.post('/submit', async (req: any, res: any) => {
 });
 
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Centralized Collaboration & Semantic Conflict Server listening on port ${PORT}`);
-});
 
-async function main() {
+function checkIfBackendRunning(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const req = http.get(`http://127.0.0.1:${port}/api/health`, { timeout: 1500 }, (res) => {
+            resolve(res.statusCode === 200);
+        });
+        req.on('error', () => resolve(false));
+        req.on('timeout', () => {
+            req.destroy();
+            resolve(false);
+        });
+    });
+}
+
+async function startServer() {
+    const isAlreadyRunning = await checkIfBackendRunning(PORT);
+    if (isAlreadyRunning) {
+        console.log(`[Backend] An existing backend process is already running on port ${PORT}.`);
+        console.log(`[Backend] Avoiding starting duplicate backend instance. Reusing existing running instance on port ${PORT}.`);
+        return;
+    }
+
     try {
         await redisClient.connect();
         console.log("Centralized Redis Client Connected");
     } catch (error) {
         console.log("Failed to connect to Redis", error);
     }
+
+    const server = app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Centralized Collaboration & Semantic Conflict Server listening on port ${PORT}`);
+    });
+
+    server.on('error', async (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE') {
+            console.warn(`[Backend] Port ${PORT} is already in use (EADDRINUSE). Checking existing backend process...`);
+            const alreadyRunning = await checkIfBackendRunning(PORT);
+            if (alreadyRunning) {
+                console.log(`[Backend] Verified active backend instance is already running on port ${PORT}.`);
+                console.log(`[Backend] Avoiding starting duplicate backend instance.`);
+                process.exit(0);
+            } else {
+                console.error(`[Backend] Port ${PORT} is occupied by an unresponsive process.`);
+                process.exit(1);
+            }
+        } else {
+            console.error('[Backend] Fatal server error:', err);
+            process.exit(1);
+        }
+    });
 }
 
-main();
+startServer();

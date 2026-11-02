@@ -39,6 +39,8 @@ export type MessageTypes =
     | "resolve_semantic_conflict"
     | "proactive_edit_activity"
     | "proactive_conflict_prediction"
+    | "genuine_conflict_detected"
+    | "genuine_conflict_resolved"
 
 interface MessageHandler {
     ( data: any, context: { userId: string | null, roomId: string, rooms: any, publisherClient: any }): void;
@@ -81,7 +83,12 @@ const requestRouter: Record<string, MessageHandler> = {
 
     language: (data, { userId, roomId, rooms, publisherClient }) => {
         publisherClient.publish(roomId, JSON.stringify({
-            type: "broadcast", excludeUserId: userId, data: { type: "language", language: data.language }
+            type: "broadcast", excludeUserId: userId, data: { 
+                type: "language", 
+                language: data.language,
+                fileName: data.fileName,
+                fileId: data.fileId
+            }
         }));
     },
 
@@ -345,6 +352,36 @@ ${data.code}
             data: {
                 type: "ai_validation_run_completed",
                 ...data,
+                timestamp: Date.now()
+            }
+        }));
+    },
+
+    genuine_conflict_detected: (data, { roomId, publisherClient }) => {
+        publisherClient.publish(roomId, JSON.stringify({
+            type: "broadcast",
+            excludeUserId: null,
+            data: {
+                type: "genuine_conflict_detected",
+                conflict: data.conflict,
+                timestamp: Date.now()
+            }
+        }));
+    },
+
+    genuine_conflict_resolved: (data, { roomId, publisherClient }) => {
+        publisherClient.publish(roomId, JSON.stringify({
+            type: "broadcast",
+            excludeUserId: null,
+            data: {
+                type: "genuine_conflict_resolved",
+                conflictId: data.conflictId,
+                fileId: data.fileId,
+                symbolName: data.symbolName,
+                chosenOptionId: data.chosenOptionId,
+                resolvedCode: data.resolvedCode,
+                resolvedBy: data.resolvedBy,
+                historyRecord: data.historyRecord,
                 timestamp: Date.now()
             }
         }));

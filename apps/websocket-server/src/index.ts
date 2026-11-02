@@ -16,23 +16,26 @@ import { createClient } from "redis"
 import { error } from "console";
 import requestRouter from "./routers/router";
 import dotenv from "dotenv";
+import path from "path";
 const { str10_36 } = require('hyperdyperid/lib/str10_36');
 const { setupWSConnection } = require('y-websocket/bin/utils');
 
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
 dotenv.config();
 
 const server = http.createServer();
 const wss = new WebSocketServer({ server });
 // Subscriber client used to listen to room-specific messages across server instances
 const pubSubClient = createClient({
-    url: process.env.REDIS_URL
+    url: process.env.REDIS_URL || 'redis://127.0.0.1:6379'
 });
 // Publisher client used to broadcast messages and maintain the global user roster in Redis Hashes
 const publisherClient = createClient({
-    url: process.env.REDIS_URL
+    url: process.env.REDIS_URL || 'redis://127.0.0.1:6379'
 });
 
 const rooms: any = {};
+const subscribedRooms = new Set<string>();
 
 function generateRoomId() {
     const id: string = str10_36();
@@ -43,7 +46,10 @@ async function start_process() {
     console.log("inside");
     pubSubClient.on("error", (err) => {
         console.log("Redis PubSub Client Error", err);
-    })
+    });
+    publisherClient.on("error", (err) => {
+        console.log("Redis Publisher Client Error", err);
+    });
 
     // Handle new WebSocket connections from clients
     wss.on("connection", async (ws, req) => {
@@ -100,9 +106,12 @@ async function start_process() {
             data: { type: "users", users: allUsers }
         }));
 
-        // If this is the first user in the room on this server instance, subscribe to the Redis Pub/Sub channel
-        if (rooms[roomId] && rooms[roomId].length === 1) {
+        // If room is not yet subscribed on this server instance, subscribe to the Redis Pub/Sub channel
+        if (!subscribedRooms.has(roomId)) {
+            subscribedRooms.add(roomId);
+            console.log(`[pubSubClient] Subscribing to Redis channel for room: ${roomId}`);
             pubSubClient.subscribe(roomId, (message) => {
+                console.log(`[pubSubClient] Message received on channel ${roomId}:`, message.substring(0, 100));
                 try {
                     const parsed = JSON.parse(message);
                     if (parsed.type === "broadcast") {
@@ -167,6 +176,7 @@ async function start_process() {
 
                 if (rooms[roomId] && rooms[roomId].length === 0) {
                     delete rooms[roomId];
+                    subscribedRooms.delete(roomId);
                     pubSubClient.unsubscribe(roomId).catch(console.error);
                 }
 
@@ -187,7 +197,7 @@ async function start_process() {
     });
     
 
-    const WS_PORT = Number(process.env.PORT) || 5000;
+    const WS_PORT = Number(process.env.WS_PORT) || (process.env.PORT && process.env.PORT !== '3000' ? Number(process.env.PORT) : 5000);
     server.listen(WS_PORT, '0.0.0.0', () => {
         console.log(`web socket server started on ${WS_PORT}`, server.address());
     });
