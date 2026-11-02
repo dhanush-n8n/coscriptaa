@@ -87,7 +87,8 @@ const requestRouter: Record<string, MessageHandler> = {
                 type: "language", 
                 language: data.language,
                 fileName: data.fileName,
-                fileId: data.fileId
+                fileId: data.fileId,
+                senderId: userId || data.senderId
             }
         }));
     },

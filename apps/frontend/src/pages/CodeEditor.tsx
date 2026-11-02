@@ -49,9 +49,23 @@ export const CodeEditor = () => {
     const userColorRef = useRef<string>('#38bdf8');
     const lastLoggedTimeRef = useRef<number>(0);
 
-    const [language, setLanguage] = useState("javascript");
+    const [language, setLanguage] = useState<string>(() => {
+        try {
+            const pathParts = window.location.pathname.split('/');
+            const roomId = pathParts[pathParts.length - 1] || '';
+            if (roomId) {
+                const roomLang = localStorage.getItem('coscripta_room_lang_' + roomId);
+                if (roomLang) return roomLang;
+            }
+            const globalLang = localStorage.getItem('coscripta_selected_language');
+            if (globalLang) return globalLang;
+        } catch (e) {}
+        return "javascript";
+    });
     const languageRef = useRef(language);
     languageRef.current = language;
+    const lastManualLanguageSelectionRef = useRef<number>(0);
+    const lastBoundFileIdRef = useRef<string | null>(null);
     const [output, setOutput] = useState<string[]>([]);
     const [socket, setSocket] = useRecoilState<WebSocket | null>(socketAtom);
     const [isLoading, setIsLoading] = useState(false);
@@ -67,6 +81,8 @@ export const CodeEditor = () => {
 
     // CRDT Codebase States
     const [files, setFiles] = useState<CodebaseFile[]>([]);
+    const filesRef = useRef<CodebaseFile[]>(files);
+    filesRef.current = files;
     const [activeFileId, setActiveFileId] = useState<string>('main_js');
     const [crdtSynced, setCrdtSynced] = useState<boolean>(false);
     const [collaborators, setCollaborators] = useState<CollaboratorPresence[]>([]);
@@ -160,8 +176,9 @@ export const CodeEditor = () => {
             });
 
             if (list.length === 0) {
-                // Seed starter codebase if new room
-                const { files: defaults, contents } = getDefaultStarterFiles('javascript');
+                // Seed starter codebase if new room using initial preferred language
+                const preferredInitial = languageRef.current || 'javascript';
+                const { files: defaults, contents } = getDefaultStarterFiles(preferredInitial);
                 defaults.forEach((f) => {
                     filesMap.set(f.id, f);
                     const yText = doc.getText('file_content_' + f.id);
@@ -178,6 +195,16 @@ export const CodeEditor = () => {
                     if (list.some(f => f.id === curr)) return curr;
                     return list[0].id;
                 });
+
+                // If user has not performed a manual language change in the last 5 seconds,
+                // sync the selected language to the entry file's explicit language
+                if (Date.now() - lastManualLanguageSelectionRef.current > 5000) {
+                    const entryFile = list.find(f => f.isEntry || f.name.startsWith('main.'));
+                    if (entryFile && entryFile.language && entryFile.language !== languageRef.current) {
+                        setLanguage(entryFile.language);
+                        languageRef.current = entryFile.language;
+                    }
+                }
             }
         };
 
@@ -267,7 +294,7 @@ export const CodeEditor = () => {
         if (!editorRef.current || !docRef.current || !providerRef.current) return;
         const doc = docRef.current;
         const provider = providerRef.current;
-        const targetFile = files.find(f => f.id === fileId);
+        const targetFile = filesRef.current.find(f => f.id === fileId) || (docRef.current ? docRef.current.getMap<CodebaseFile>('codebase_files').get(fileId) : undefined);
         if (!targetFile) return;
 
         // Destroy previous MonacoBinding cleanly
@@ -280,12 +307,18 @@ export const CodeEditor = () => {
         const editor = editorRef.current;
         const monaco = monacoRef.current || (window as any).monaco;
 
-        const fileLang = targetFile.language || getLanguageFromFilename(targetFile.name);
-        setLanguage(fileLang);
+        lastBoundFileIdRef.current = fileId;
+        const detectedLang = targetFile.language || getLanguageFromFilename(targetFile.name);
+        const effectiveLang = detectedLang || languageRef.current || 'javascript';
+
+        if (effectiveLang && effectiveLang !== languageRef.current) {
+            setLanguage(effectiveLang);
+            languageRef.current = effectiveLang;
+        }
 
         const model = editor.getModel();
         if (monaco && model) {
-            monaco.editor.setModelLanguage(model, fileLang);
+            monaco.editor.setModelLanguage(model, effectiveLang);
         }
 
         // Bind Monaco Editor to this file's Y.Text CRDT buffer
@@ -426,18 +459,18 @@ export const CodeEditor = () => {
             }
         };
         yText.observe(observer);
-    }, [files, logCRDTEdit, user.roomId, params.roomId, user.id, user.name]);
+    }, [logCRDTEdit, user.roomId, params.roomId, user.id, user.name]);
 
-    // Re-bind when activeFileId or files change
+    // Re-bind when activeFileId changes or editor mounts
     useEffect(() => {
         if (activeFileId && editorRef.current) {
             bindEditorToFile(activeFileId);
         }
     }, [activeFileId, bindEditorToFile]);
 
-    // Ensure selected language and active filename extension always agree
+    // Ensure selected language and active filename extension always agree without infinite loop
     useEffect(() => {
-        const curFile = files.find(f => f.id === activeFileId);
+        const curFile = filesRef.current.find(f => f.id === activeFileId);
         if (!curFile) return;
 
         const currentLang = languageRef.current || language;
@@ -447,7 +480,8 @@ export const CodeEditor = () => {
             : currentLang === 'go' ? '.go' 
             : '';
 
-        if (ext && !curFile.name.endsWith(ext)) {
+        const isEntry = curFile.isEntry || curFile.name.startsWith('main.') || activeFileId === 'main_js' || activeFileId === 'main_py';
+        if (isEntry && ext && (!curFile.name.endsWith(ext) || curFile.language !== currentLang)) {
             const updatedName = curFile.name.replace(/\.[^.]+$/, '') + ext;
             setFiles(prev => prev.map(f => (f.id === activeFileId || f.name.startsWith('main.') || f.isEntry) ? {
                 ...f,
@@ -479,7 +513,7 @@ export const CodeEditor = () => {
                 }
             }
         }
-    }, [language, activeFileId, files]);
+    }, [language, activeFileId]);
 
     // -------------------------------------------------------------
     // FILE OPERATIONS (CREATE / DELETE / SWITCH)
@@ -1282,9 +1316,26 @@ export const CodeEditor = () => {
                 }
 
                 if (data.type === "language") {
+                    // Ignore self echo or if language is already active
+                    if (data.senderId === user.id || data.language === languageRef.current) {
+                        return;
+                    }
+
+                    // Guard against remote updates overriding recent local manual selection
+                    if (Date.now() - lastManualLanguageSelectionRef.current < 2500) {
+                        return;
+                    }
+
                     toast.success(`Language changed to ${data.language.toUpperCase()}`);
                     setLanguage(data.language);
                     languageRef.current = data.language;
+                    try {
+                        localStorage.setItem('coscripta_selected_language', data.language);
+                        const currentRoom = user.roomId || params.roomId;
+                        if (currentRoom) {
+                            localStorage.setItem('coscripta_room_lang_' + currentRoom, data.language);
+                        }
+                    } catch (e) {}
 
                     if (realConflictRef.current && realConflictRef.current.language !== data.language) {
                         activeConflictKeyRef.current = null;
@@ -1491,7 +1542,7 @@ export const CodeEditor = () => {
                 socket.removeEventListener('message', handleMessage);
             };
         }
-    }, [socket, language, currentButtonState, isLoading, connectedUsers, navigate, params.roomId, fetchConflictHistory]);
+    }, [socket, navigate, params.roomId, fetchConflictHistory]);
 
     // -------------------------------------------------------------
     // RUN / SUBMIT CODE
@@ -1591,8 +1642,20 @@ export const CodeEditor = () => {
     };
 
     const handleLanguageChange = (value: any) => {
+        if (!value || value === languageRef.current) return;
+
+        lastManualLanguageSelectionRef.current = Date.now();
         setLanguage(value);
         languageRef.current = value;
+
+        try {
+            localStorage.setItem('coscripta_selected_language', value);
+            const currentRoom = user.roomId || params.roomId;
+            if (currentRoom) {
+                localStorage.setItem('coscripta_room_lang_' + currentRoom, value);
+            }
+        } catch (e) {}
+
         const doc = docRef.current;
 
         // Invalidate any active conflict from previous language
@@ -1609,7 +1672,7 @@ export const CodeEditor = () => {
             : value === 'go' ? '.go' 
             : '';
 
-        const targetFile = files.find(f => f.id === activeFileId) || files[0];
+        const targetFile = filesRef.current.find(f => f.id === activeFileId) || filesRef.current[0];
         let newFileName = targetFile?.name;
         if (targetFile && ext) {
             let updatedName = targetFile.name;
@@ -1682,7 +1745,8 @@ export const CodeEditor = () => {
                 language: value,
                 fileName: newFileName,
                 fileId: activeFileId,
-                roomId: user.roomId
+                roomId: user.roomId,
+                senderId: user.id
             })
         );
         toast.info(`Language set to ${value.toUpperCase()}${newFileName ? ` (${newFileName})` : ''}`);
