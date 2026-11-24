@@ -213,14 +213,17 @@ async function start_process() {
 }
 
 async function main() {
-    try {
-        await pubSubClient.connect();
-        await publisherClient.connect();
-        await start_process();
-        console.log("Redis Client connected");
-    } catch (e) {
-        console.log("Failed to connect to Redis", e);
-        process.exit(1);
+    while (true) {
+        try {
+            if (!pubSubClient.isOpen) await pubSubClient.connect();
+            if (!publisherClient.isOpen) await publisherClient.connect();
+            await start_process();
+            console.log("Redis Client connected");
+            break;
+        } catch (e) {
+            console.log("Failed to connect to Redis. Retrying in 2 seconds...", e);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
     }
 }
 

@@ -46,6 +46,9 @@ export const CodeEditor = () => {
     const docRef = useRef<Y.Doc | null>(null);
     const providerRef = useRef<WebsocketProvider | null>(null);
     const bindingRef = useRef<MonacoBinding | null>(null);
+    const yTextObserverRef = useRef<any>(null);
+    const currentObservedYTextRef = useRef<Y.Text | null>(null);
+    const bindEditorToFileRef = useRef<(fileId: string) => void>(() => {});
     const userColorRef = useRef<string>('#38bdf8');
     const lastLoggedTimeRef = useRef<number>(0);
 
@@ -150,6 +153,30 @@ export const CodeEditor = () => {
         const currentRoom = user.roomId || params.roomId;
         if (!currentRoom) return;
 
+        // If provider already exists for this room, do not recreate
+        if (providerRef.current && docRef.current && (providerRef.current as any).roomname === currentRoom) {
+            return;
+        }
+
+        // Clean up previous binding & provider if room changed
+        if (bindingRef.current) {
+            bindingRef.current.destroy();
+            bindingRef.current = null;
+        }
+        if (currentObservedYTextRef.current && yTextObserverRef.current) {
+            currentObservedYTextRef.current.unobserve(yTextObserverRef.current);
+            yTextObserverRef.current = null;
+            currentObservedYTextRef.current = null;
+        }
+        if (providerRef.current) {
+            providerRef.current.destroy();
+            providerRef.current = null;
+        }
+        if (docRef.current) {
+            docRef.current.destroy();
+            docRef.current = null;
+        }
+
         const doc = new Y.Doc();
         docRef.current = doc;
 
@@ -157,38 +184,70 @@ export const CodeEditor = () => {
         const provider = new WebsocketProvider(yjsWsUrl, currentRoom, doc);
         providerRef.current = provider;
 
+        const filesMap = doc.getMap<CodebaseFile>('codebase_files');
+        const editsArray = doc.getArray<CRDTEditEvent>('concurrent_edits');
+
         provider.on('status', (event: any) => {
             setCrdtSynced(event.status === 'connected');
         });
 
+        // Handle initial synchronization with Yjs server
         provider.on('sync', (isSynced: boolean) => {
             setCrdtSynced(isSynced);
+            if (isSynced) {
+                const list: CodebaseFile[] = [];
+                filesMap.forEach((val) => {
+                    list.push(val);
+                });
+
+                if (list.length === 0) {
+                    // Seed starter codebase ONLY when the room is genuinely new and empty on server
+                    const preferredInitial = languageRef.current || 'javascript';
+                    const { files: defaults, contents } = getDefaultStarterFiles(preferredInitial);
+                    doc.transact(() => {
+                        defaults.forEach((f) => {
+                            filesMap.set(f.id, f);
+                            const yText = doc.getText('file_content_' + f.id);
+                            if (yText.length === 0 && contents[f.id]) {
+                                yText.insert(0, contents[f.id]);
+                            }
+                        });
+                    });
+                    setFiles(defaults);
+                    setActiveFileId(defaults[0].id);
+                    if (editorRef.current) {
+                        bindEditorToFileRef.current(defaults[0].id);
+                    }
+                } else {
+                    list.sort((a, b) => (b.isEntry ? 1 : 0) - (a.isEntry ? 1 : 0) || a.name.localeCompare(b.name));
+                    setFiles(list);
+                    const chosenActiveId = list.some(f => f.id === activeFileId) ? activeFileId : list[0].id;
+                    setActiveFileId(chosenActiveId);
+
+                    // Sync language to existing entry file if not manually switched recently
+                    if (Date.now() - lastManualLanguageSelectionRef.current > 3000) {
+                        const entryFile = list.find(f => f.isEntry || f.name.startsWith('main.'));
+                        if (entryFile && entryFile.language && entryFile.language !== languageRef.current) {
+                            setLanguage(entryFile.language);
+                            languageRef.current = entryFile.language;
+                        }
+                    }
+
+                    if (editorRef.current) {
+                        bindEditorToFileRef.current(chosenActiveId);
+                    }
+                }
+            }
         });
 
-        const filesMap = doc.getMap<CodebaseFile>('codebase_files');
-        const editsArray = doc.getArray<CRDTEditEvent>('concurrent_edits');
-
-        // Sync files map to React state
+        // Observe remote updates to the files map
         const handleFilesChange = () => {
             const list: CodebaseFile[] = [];
             filesMap.forEach((val) => {
                 list.push(val);
             });
 
-            if (list.length === 0) {
-                // Seed starter codebase if new room using initial preferred language
-                const preferredInitial = languageRef.current || 'javascript';
-                const { files: defaults, contents } = getDefaultStarterFiles(preferredInitial);
-                defaults.forEach((f) => {
-                    filesMap.set(f.id, f);
-                    const yText = doc.getText('file_content_' + f.id);
-                    if (yText.length === 0 && contents[f.id]) {
-                        yText.insert(0, contents[f.id]);
-                    }
-                });
-                setFiles(defaults);
-                setActiveFileId(defaults[0].id);
-            } else {
+            if (list.length > 0) {
                 list.sort((a, b) => (b.isEntry ? 1 : 0) - (a.isEntry ? 1 : 0) || a.name.localeCompare(b.name));
                 setFiles(list);
                 setActiveFileId((curr) => {
@@ -196,20 +255,14 @@ export const CodeEditor = () => {
                     return list[0].id;
                 });
 
-                // If user has not performed a manual language change in the last 5 seconds,
-                // sync the selected language to the entry file's explicit language
-                if (Date.now() - lastManualLanguageSelectionRef.current > 5000) {
-                    const entryFile = list.find(f => f.isEntry || f.name.startsWith('main.'));
-                    if (entryFile && entryFile.language && entryFile.language !== languageRef.current) {
-                        setLanguage(entryFile.language);
-                        languageRef.current = entryFile.language;
-                    }
+                // Re-bind if editor is mounted and file is not yet bound
+                if (editorRef.current && (!bindingRef.current || lastBoundFileIdRef.current !== activeFileId)) {
+                    bindEditorToFileRef.current(activeFileId);
                 }
             }
         };
 
         filesMap.observe(handleFilesChange);
-        handleFilesChange();
 
         // Sync concurrent edits stream
         const handleEditsChange = () => {
@@ -253,6 +306,11 @@ export const CodeEditor = () => {
                 bindingRef.current.destroy();
                 bindingRef.current = null;
             }
+            if (currentObservedYTextRef.current && yTextObserverRef.current) {
+                currentObservedYTextRef.current.unobserve(yTextObserverRef.current);
+                yTextObserverRef.current = null;
+                currentObservedYTextRef.current = null;
+            }
             provider.destroy();
             doc.destroy();
         };
@@ -294,27 +352,39 @@ export const CodeEditor = () => {
         if (!editorRef.current || !docRef.current || !providerRef.current) return;
         const doc = docRef.current;
         const provider = providerRef.current;
-        const targetFile = filesRef.current.find(f => f.id === fileId) || (docRef.current ? docRef.current.getMap<CodebaseFile>('codebase_files').get(fileId) : undefined);
+        const filesMap = doc.getMap<CodebaseFile>('codebase_files');
+        const targetFile = filesRef.current.find(f => f.id === fileId) || filesMap.get(fileId);
         if (!targetFile) return;
 
-        // Destroy previous MonacoBinding cleanly
+        // If already cleanly bound to this exact file, skip re-binding
+        if (bindingRef.current && lastBoundFileIdRef.current === fileId) {
+            return;
+        }
+
+        // Destroy previous MonacoBinding cleanly and remove old observer
         if (bindingRef.current) {
-            bindingRef.current.destroy();
+            try {
+                bindingRef.current.destroy();
+            } catch (e) {}
             bindingRef.current = null;
+        }
+        if (currentObservedYTextRef.current && yTextObserverRef.current) {
+            try {
+                currentObservedYTextRef.current.unobserve(yTextObserverRef.current);
+            } catch (e) {}
+            yTextObserverRef.current = null;
+            currentObservedYTextRef.current = null;
         }
 
         const yText = doc.getText('file_content_' + fileId);
         const editor = editorRef.current;
         const monaco = monacoRef.current || (window as any).monaco;
 
+        const isSwitchingFile = lastBoundFileIdRef.current !== fileId;
         lastBoundFileIdRef.current = fileId;
+
         const detectedLang = targetFile.language || getLanguageFromFilename(targetFile.name);
         const effectiveLang = detectedLang || languageRef.current || 'javascript';
-
-        if (effectiveLang && effectiveLang !== languageRef.current) {
-            setLanguage(effectiveLang);
-            languageRef.current = effectiveLang;
-        }
 
         const model = editor.getModel();
         if (monaco && model) {
@@ -343,7 +413,7 @@ export const CodeEditor = () => {
             lastBaseVersionRef.current = yText.toString();
         }
 
-        // Listen to edits on this file's text buffer
+        // Listen to edits on this file's text buffer for conflict detection
         const observer = (event: any) => {
             if (event.transaction.local && !isResolvingRef.current) {
                 logCRDTEdit(targetFile, 'modify', `Edited ${targetFile.name}`);
@@ -458,8 +528,13 @@ export const CodeEditor = () => {
                 }, 750);
             }
         };
+
+        yTextObserverRef.current = observer;
+        currentObservedYTextRef.current = yText;
         yText.observe(observer);
     }, [logCRDTEdit, user.roomId, params.roomId, user.id, user.name]);
+
+    bindEditorToFileRef.current = bindEditorToFile;
 
     // Re-bind when activeFileId changes or editor mounts
     useEffect(() => {
@@ -468,58 +543,19 @@ export const CodeEditor = () => {
         }
     }, [activeFileId, bindEditorToFile]);
 
-    // Ensure selected language and active filename extension always agree without infinite loop
-    useEffect(() => {
-        const curFile = filesRef.current.find(f => f.id === activeFileId);
-        if (!curFile) return;
-
-        const currentLang = languageRef.current || language;
-        const ext = currentLang === 'python' ? '.py' 
-            : (currentLang === 'javascript' || currentLang === 'typescript') ? '.js' 
-            : currentLang === 'cpp' ? '.cpp' 
-            : currentLang === 'go' ? '.go' 
-            : '';
-
-        const isEntry = curFile.isEntry || curFile.name.startsWith('main.') || activeFileId === 'main_js' || activeFileId === 'main_py';
-        if (isEntry && ext && (!curFile.name.endsWith(ext) || curFile.language !== currentLang)) {
-            const updatedName = curFile.name.replace(/\.[^.]+$/, '') + ext;
-            setFiles(prev => prev.map(f => (f.id === activeFileId || f.name.startsWith('main.') || f.isEntry) ? {
-                ...f,
-                name: updatedName,
-                path: '/' + updatedName,
-                language: currentLang,
-                updatedAt: Date.now()
-            } : f));
-
-            if (docRef.current) {
-                const filesMap = docRef.current.getMap<CodebaseFile>('codebase_files');
-                const f = filesMap.get(activeFileId) || Array.from(filesMap.values()).find(file => file.id === activeFileId || file.name.startsWith('main.') || file.isEntry);
-                if (f) {
-                    filesMap.set(f.id, {
-                        ...f,
-                        name: updatedName,
-                        path: '/' + updatedName,
-                        language: currentLang,
-                        updatedAt: Date.now()
-                    });
-                }
-            }
-
-            if (editorRef.current) {
-                const model = editorRef.current.getModel();
-                const monaco = monacoRef.current || (window as any).monaco;
-                if (model && monaco) {
-                    monaco.editor.setModelLanguage(model, currentLang);
-                }
-            }
-        }
-    }, [language, activeFileId]);
-
     // -------------------------------------------------------------
     // FILE OPERATIONS (CREATE / DELETE / SWITCH)
     // -------------------------------------------------------------
     const handleSelectFile = (fileId: string) => {
         setActiveFileId(fileId);
+        const f = filesRef.current.find(file => file.id === fileId) || (docRef.current ? docRef.current.getMap<CodebaseFile>('codebase_files').get(fileId) : undefined);
+        if (f) {
+            const fileLang = f.language || getLanguageFromFilename(f.name);
+            if (fileLang && fileLang !== languageRef.current) {
+                setLanguage(fileLang);
+                languageRef.current = fileLang;
+            }
+        }
     };
 
     const handleCreateFile = (fileName: string) => {
@@ -1361,21 +1397,6 @@ export const CodeEditor = () => {
                         }
                         return f;
                     }));
-
-                    if (docRef.current) {
-                        const filesMap = docRef.current.getMap<CodebaseFile>('codebase_files');
-                        const file = filesMap.get(targetId);
-                        if (file) {
-                            const uName = ext ? file.name.replace(/\.[^.]+$/, '') + ext : file.name;
-                            filesMap.set(targetId, {
-                                ...file,
-                                name: uName,
-                                path: '/' + uName,
-                                language: data.language,
-                                updatedAt: Date.now()
-                            });
-                        }
-                    }
 
                     if (editorRef.current) {
                         const model = editorRef.current.getModel();

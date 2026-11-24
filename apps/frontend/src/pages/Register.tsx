@@ -39,13 +39,19 @@ export const Register = () => {
         const currentUserId = user.id || generateId();
         const finalRoomId = overrideRoomId !== undefined ? overrideRoomId : roomId;
 
-        if (!socket || socket.readyState === WebSocket.CLOSED) {
-            console.log("inside");
+        if (socket && socket.readyState !== WebSocket.CLOSED) {
+            try {
+                socket.close();
+            } catch (e) {}
+            setSocket(null);
+        }
 
-            const wsBaseUrl = import.meta.env.VITE_WEBSOCKET_SERVER_URL || `ws://${window.location.hostname}:5000`;
-            const ws = new WebSocket(`${wsBaseUrl}?roomId=${finalRoomId}&id=${currentUserId}&name=${encodeURIComponent(name)}`);
+        console.log("inside");
 
-            setSocket(ws);
+        const wsBaseUrl = import.meta.env.VITE_WEBSOCKET_SERVER_URL || `ws://${window.location.hostname}:5000`;
+        const ws = new WebSocket(`${wsBaseUrl}?roomId=${finalRoomId}&id=${currentUserId}&name=${encodeURIComponent(name)}`);
+
+        setSocket(ws);
 
             ws.onopen = () => {
                 console.log("Connected to WebSocket");
@@ -76,13 +82,10 @@ export const Register = () => {
             };
 
             ws.onclose = () => {
-                console.log("WebSocket connnection closed from register page");
+                console.log("WebSocket connection closed from register page");
                 setLoading(false);
-            }
-        } else {
-            setLoading(false);
-        }
-    }
+            };
+    };
 
     const handleNewRoom = () => {
         console.log("new room opened")
